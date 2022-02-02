@@ -343,7 +343,7 @@ class ui_main(QMainWindow):
         try:
             alerts = json["alerts"]
             for x in alerts:
-                sender, event, start, end, description, *alerts = x
+                sender, event, start, end, description, *alertsExtra = x.values()
                 start_time = localizeTime(start, json["timezone"]).strftime("%a %d, %H:%M")
                 end_time = localizeTime(end, json["timezone"]).strftime("%a %d, %H:%M")
                 alertsData.append([sender,event,start_time,end_time,description])
