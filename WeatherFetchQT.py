@@ -1,4 +1,4 @@
-import requests as req, sys, pandas as pd, pytz
+import requests as req, sys, pandas as pd, pytz, logging, pathlib
 from PySide6 import QtGui
 from datetime import datetime
 from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QInputDialog
@@ -8,6 +8,10 @@ from ui_main import Ui_Widget
 
 #My API Key of course
 api_key = '412e21305fa900bbca11c6434107bc57'
+#Sets logging information
+fileName = str(datetime.today().strftime('%m-%d-%y_%H-%M-%S'))
+level = logging.WARNING
+logging.basicConfig(filename = f'{fileName}.txt', level=level, datefmt='%m-%d-%y %H:%M:%S', format='%(asctime)s > %(message)s')
 #Dictionary of states and their postal codes. For some reason if you want to use a State Code, you are required to use the US country code - it isn't implicit.
 #Due to this we have to distinguish between a State Codes and Country Codes, by creating a dictionary set we get a dual purpose
 #1) We get to validate state codes and return a properly formatted location
@@ -66,6 +70,47 @@ states = {
     'WY': 'Wyoming'
 }
 
+#sets a few exceptions to use later for handling status codes
+class ApiGeneralException(Exception):
+    message = "API Exception occurred. Contact OpenWeatherMap for assistance."
+    def __init__(self, message):
+        super.__init__(message)
+
+class ApiKeyException(Exception):
+    message = """API Key Exception Occured. Please check that the API Key has been activated, is correct, and is accessing valid content. 
+        (For example, a free user trying to access paid content)"""
+    def __init__(self, message):
+        super.__init__(message)
+
+class ApiNoLocationException(Exception):
+    message = "The geopgraphic location was not found or the API call was formatted incorrectly. Please check the that the API call is correct."
+    def __init__(self, message):
+        super.__init__(message)
+
+class ApiCallLimitException(Exception):
+    message = "The free limit of 60 API calls per minute has been exceeded. Please wait to call the API again, or upgrade to a paid plan"
+    def __init__(self, message):
+        super.__init__(message)
+
+#function to raise the appropriate error for the status code
+def raiseException(code):
+    if code == 401:
+        raise ApiKeyException
+    elif code in [404, 400]:
+        raise ApiNoLocationException
+    elif code == 429:
+        raise ApiCallLimitException
+    elif code in [500, 502, 503, 504]:
+        raise ApiGeneralException
+    pass
+
+#setup a messagebox function
+def MessagePopup(message):
+        msgBox = QMessageBox()
+        msgBox.setText(message)
+        msgBox.exec()
+        pass
+
 def get_location(location):
     #Checks for a String (City, State basically), Integer (Zip Code), or Tuple (Lat, Lon). Unlike with the get_weather_data function, we will check for a tuple and make an API call here. 
     #The reason for this is simple, it will let us use the Lat/Lon fields in the JSON data we get from get_weather data. This, in turn, lets us grab the closes City to those coords to display. 
@@ -76,9 +121,12 @@ def get_location(location):
         try:
             loc_list[1] = loc_list[1].strip()
             if (loc_list[1] in states.keys()) or (loc_list[1] in states.values()):
-                stateNames = list(states.values())
-                stateKeys = list(states.keys())
-                stateCode = stateKeys[stateNames.index(loc_list[1])]
+                if len(loc_list[1]) != 2:
+                    stateNames = list(states.values())
+                    stateKeys = list(states.keys())
+                    stateCode = stateKeys[stateNames.index(loc_list[1])]
+                else:
+                    stateCode = loc_list[1]
                 if len(loc_list)<3:
                     locStr = f'{loc_list[0]},{stateCode},US'
                 else:
@@ -87,6 +135,7 @@ def get_location(location):
         except:
             pass
         geolocation_api = req.get(f'http://api.openweathermap.org/geo/1.0/direct?q={locStr}&appid={api_key}')
+        
     elif type(location) == int:
         geolocation_api = req.get(f'http://api.openweathermap.org/geo/1.0/zip?zip={location}&appid={api_key}')
     elif type(location) == tuple:
@@ -100,26 +149,42 @@ def get_location(location):
     else:
         #Popup for invalid entry, return failure string.
         message = f'The input, {location}, was not valid. Please make sure you are entering a Zip Code or City, State, Country (where state is applicable). Check your input and try again.'
-        msgBox = QMessageBox()
-        msgBox.setText(message)
-        msgBox.exec()
+        MessagePopup(message)
         return message
+    #Setup variables to put in log message. 
+    params = geolocation_api.headers["X-Cache-Key"]
+    head_length = geolocation_api.headers["Content-Length"]
+    logging.log(logging.INFO, f'[Geolocation_api] Status Code: {geolocation_api.status_code} | Location: {location} | Params: {params} | Returned Length: {head_length}')
     geolocation_data = geolocation_api.json()
-    if len(geolocation_data)<=0:
-        #Popup for lack of location, and return failure string.
-        message = f'Error: Location, {location} - was not found. Please check for typos and try again'
-        msgBox = QMessageBox()
-        msgBox.setText(message)
-        msgBox.exec()
-        return message
-    #checks if there were multiple locations in the data, since this is only possible when providing it by Name (we don't care about tuples as that's only for function calls).
-    #if there are multiple locations then output a message for the issue. If this was a downloaded app then I'd add a config for this (Don't remind me again type thing, or a togglable setting)
-    elif len(geolocation_data)>1 and type(location) == str:
-        message = f'There were total of {len(geolocation_data)} locations detected for the provided location: {location}. We will use the first location found. Please add a country and state to your query (where applicable)'
-        msgBox = QMessageBox()
-        msgBox.setText(message)
-        msgBox.exec()
-    return geolocation_data
+    try:
+        raiseException(geolocation_api.status_code)
+        if len(geolocation_data)<=0:
+            #Popup for lack of location, and return failure string.
+            message = f'Error: Location, {location} - was not found. Please check for typos and try again'
+            MessagePopup(message)
+            return message
+        #checks if there were multiple locations in the data, since this is only possible when providing it by Name (we don't care about tuples as that's only for function calls).
+        #If there are multiple locations then output a message for the issue. 
+        #If this was a downloaded app then I'd add a config for this (Don't remind me again type thing, or a togglable setting)
+        elif len(geolocation_data)>1 and type(location) == str:
+            message = f'There were total of {len(geolocation_data)} locations detected for the provided location: {location}. We will use the first location found. Please add a country and state to your query (where applicable)'
+            MessagePopup(message)
+
+        return geolocation_data
+    #Handling status code exceptions. I have to return the exceptions as a list so the IDE doesn't flag non-existent errors later on. 
+    except ApiGeneralException:
+        logging.log(logging.WARNING, ApiGeneralException)
+        return [ApiGeneralException]
+
+    except ApiCallLimitException:
+        return [ApiCallLimitException]
+
+    except ApiKeyException:
+        return [ApiKeyException]
+
+    except ApiNoLocationException:
+        logging.log(logging.INFO, f'{ApiNoLocationException} \n {location}')
+        return [ApiNoLocationException]
 
 def get_weather_data(location):
     #Attempts to convert location to an integer. Its a basic check for the Zipcode, and preventing any API call issues caused by floats or the like.
@@ -128,21 +193,53 @@ def get_weather_data(location):
         location = int(location)
     except:
         pass
+    
     #Calls the get_location function with the given location. This lets us search for the coords of a given location. We use these coords in the API call later.
     geolocation_data = get_location(location)
     #This is will check that the returned output is JSON. In our case, this checks if the location check failed without having to complicate the returned content. 
     if type(geolocation_data) == str:
         return geolocation_data
+    elif isinstance(geolocation_data[0], Exception): #Catch if an exception occured when looking up the data for locations.
+        return []
 
-    #The data structure for the JSON is ever so slightly different if you used a Zip instead of City, State. By checking for Int/Str we are basically checking for Zip/City, State. This makes sure we can grab the right data and return it
+    #The data structure for the JSON is ever so slightly different if you used a Zip instead of City, State. 
+    #By checking for Int/Str we are basically checking for Zip/City, State. This makes sure we can grab the right data and return it
     if type(location) == str:
         onecall_api = req.get(f'https://api.openweathermap.org/data/2.5/onecall?lat={geolocation_data[0]["lat"]}&lon={geolocation_data[0]["lon"]}&units=imperial&appid={api_key}')
     elif type(location) == int:
         onecall_api = req.get(f'https://api.openweathermap.org/data/2.5/onecall?lat={geolocation_data["lat"]}&lon={geolocation_data["lon"]}&units=imperial&appid={api_key}')
+    #Sets up the variables for logging.
+    params = onecall_api.headers["X-Cache-Key"]
+    head_length = onecall_api.headers["Content-Length"]
+    logging.log(logging.INFO, f'[Onecall_api] Status Code: {onecall_api.status_code} | Location: {location} | Params: {params} | "Returned Length": {head_length}')
+    
     #return the JSON data. 
-    return onecall_api.json()
+    onecall_data = onecall_api.json()
+    try:
+        raiseException(onecall_api.status_code)
+        return onecall_data
 
-#Since we commonly need to convert a UNIX time code to UTC then localize it for the timezone, I created a function to handle that. It returns an unformatted time, which we format on at the function call depending on the need.
+    #Handle status code exceptions. Returning a blank list if there is one. 
+    except ApiGeneralException:
+        MessagePopup("An error occured when retrieving weather information.")
+        logging.log(logging.WARNING, ApiGeneralException)
+        return []
+
+    except ApiCallLimitException:
+        MessagePopup("Request server currently overloaded. Please try again in a few minutes.")
+        return []
+
+    except ApiKeyException:
+        MessagePopup("There was an issue contacting the request server.")
+        return []
+
+    except ApiNoLocationException:
+        MessagePopup("The location was not found. This was either due to the location not being available for weather data, or a typo. Please check your entry and try again.")
+        logging.log(logging.INFO, f'{ApiNoLocationException} \n {location}')
+        return []
+
+#Since we commonly need to convert a UNIX time code to UTC then localize it for the timezone, 
+#I created a function to handle that. It returns an unformatted time, which we format on at the function call depending on the need.
 def localizeTime(unixTime, timezone):
    localTime = pytz.utc.localize(datetime.utcfromtimestamp(unixTime))
    return localTime.astimezone(pytz.timezone(timezone))
@@ -177,9 +274,10 @@ def windSpeedDescription(windSpeed):
         return "Hurricane Force"
     else:
         return "Wind Error"
-#Sets a TableModel Class. This is neccessary to work with a TableView in QT. The reason it is neccessary is because QAbstractTableModel and its subclasses don't do anything inherently in the QT library. 
-#You have to manually sub-class it and define what it does. In this case it combines QT and Pandas to allow me to easily and dynamically define tables for the TableViews in my UI files. 
-#This was easily the hardest part of the project. 
+#Sets a TableModel Class. This is neccessary to work with a TableView in QT. 
+#The reason it is neccessary is because QAbstractTableModel and its subclasses don't do anything inherently in the QT library. 
+#You have to manually sub-class it and define what it does. 
+# In this case it combines QT and Pandas to allow me to easily and dynamically define tables for the TableViews in my UI files. 
 class TableModel(QAbstractTableModel):
     def __init__(self, data):
         super(TableModel, self).__init__()
@@ -259,85 +357,101 @@ class ui_main(QMainWindow):
 
     #Processes and Displays "Current" information, and general info. This is stuff like the current time, location, current weather, etc.
     def displayCurrent(self, json):
-        current = json["current"]
-        loc_name = get_location((json["lat"],json["lon"]))
-        self.ui.labelCurTime.setText(localizeTime(current["dt"],json["timezone"]).strftime("%b %d, %H:%M"))
-        if loc_name[0]["country"] == "US":
-            labelLocMsg = f'{loc_name[0]["name"]}, {loc_name[0]["state"]}'
-        else:
-            labelLocMsg = f'{loc_name[0]["name"]}, {loc_name[0]["country"]}'
-        self.ui.labelLoc.setText(labelLocMsg)
-        self.ui.labelCurTemp.setText(f'{current["temp"]:.0f}\N{DEGREE SIGN}F')
-        self.ui.labelFeelsLike.setText(f'Feels like {current["feels_like"]:.0f}\N{DEGREE SIGN}F. {current["weather"][0]["description"].title()}. {windSpeedDescription(current["wind_speed"])}')
-        self.ui.labelHumidity.setText(f'Humidity: {current["humidity"]:.0f}%')
-        self.ui.labelWind.setText(f'Wind Speed: {current["wind_speed"]}mph')
-        
-        picture = QtGui.QPixmap()
-        picture.loadFromData(req.get(f'http://openweathermap.org/img/wn/{current["weather"][0]["icon"]}@2x.png').content)
-        self.ui.labelImg.setPixmap(picture)
+        try:
+            if not isinstance(json, str):
+                current = json["current"]
+                loc_name = get_location((json["lat"],json["lon"]))
+                self.ui.labelCurTime.setText(localizeTime(current["dt"],json["timezone"]).strftime("%b %d, %H:%M"))
+                if loc_name[0]["country"] == "US":
+                    labelLocMsg = f'{loc_name[0]["name"]}, {loc_name[0]["state"]}'
+                else:
+                    labelLocMsg = f'{loc_name[0]["name"]}, {loc_name[0]["country"]}'
+                self.ui.labelLoc.setText(labelLocMsg)
+                self.ui.labelCurTemp.setText(f'{current["temp"]:.0f}\N{DEGREE SIGN}F')
+                self.ui.labelFeelsLike.setText(f'Feels like {current["feels_like"]:.0f}\N{DEGREE SIGN}F. {current["weather"][0]["description"].title()}. {windSpeedDescription(current["wind_speed"])}')
+                self.ui.labelHumidity.setText(f'Humidity: {current["humidity"]:.0f}%')
+                self.ui.labelWind.setText(f'Wind Speed: {current["wind_speed"]}mph')
+                
+                picture = QtGui.QPixmap()
+                picture.loadFromData(req.get(f'http://openweathermap.org/img/wn/{current["weather"][0]["icon"]}@2x.png').content)
+                self.ui.labelImg.setPixmap(picture)
+        except:
+            pass
     #Processes and Displays the Minutely information. This (for some reason) is only the Precpitation. This forecasts 1hr (60min)
     def displayMin(self, json):
-        minutely = json["minutely"]
-        tableMin = self.ui.tableViewMin
-        minuteData = []
+        try:
+            if not isinstance(json, str):
+                minutely = json["minutely"]
+                tableMin = self.ui.tableViewMin
+                minuteData = []
 
-        for x in minutely:
-            dt, precip = x
-            minuteTime = localizeTime(x[dt], json["timezone"]).strftime("%H:%M")
-            minuteData.append([minuteTime,f'{x[precip]:.0%}'])
+                for x in minutely:
+                    dt, precip = x
+                    minuteTime = localizeTime(x[dt], json["timezone"]).strftime("%H:%M")
+                    minuteData.append([minuteTime,f'{x[precip]:.0%}'])
 
-        minuteFrame = pd.DataFrame(
-            minuteData,
-            columns = ['DT','Precip']
-            )
+                minuteFrame = pd.DataFrame(
+                    minuteData,
+                    columns = ['DT','Precip']
+                    )
 
-        tableMin.model = TableModel(minuteFrame)
-        tableMin.setModel(tableMin.model)
-    
+                tableMin.model = TableModel(minuteFrame)
+                tableMin.setModel(tableMin.model)
+        except:
+            pass
     #Processes and Displays the Hourly information. This forecasts 48hrs
     def displayHourly(self, json):
         #Display: Time, Temp, Feels Like, Humidity, Precip
-        hourly = json["hourly"]
-        tableHourly = self.ui.tableViewHourly
-        hourlyData = []
-        for x in hourly:
-            
-            time = localizeTime(x["dt"], json["timezone"]).strftime("%b %d, %H:%M")
-            temp = f'{x["temp"]:.0f}\N{DEGREE SIGN}F'
-            feelsLike = f'{x["feels_like"]:.0f}\N{DEGREE SIGN}F'
-            precip = f'{x["pop"]:.0%}'
-            humidity = f'{x["humidity"]:.0f}%'
-            hourlyData.append([time, temp, feelsLike, humidity, precip])
-        hourlyFrame = pd.DataFrame(
-            hourlyData,
-            columns=['Time','Temp','Feels Like', 'Humidity', 'Precip']
-            )
-        tableHourly.model = TableModel(hourlyFrame)
-        tableHourly.setModel(tableHourly.model)
+        try:
+            if not isinstance(json, str):
+                hourly = json["hourly"]
+                tableHourly = self.ui.tableViewHourly
+                hourlyData = []
+                for x in hourly:
+                    
+                    time = localizeTime(x["dt"], json["timezone"]).strftime("%b %d, %H:%M")
+                    temp = f'{x["temp"]:.0f}\N{DEGREE SIGN}F'
+                    feelsLike = f'{x["feels_like"]:.0f}\N{DEGREE SIGN}F'
+                    precip = f'{x["pop"]:.0%}'
+                    humidity = f'{x["humidity"]:.0f}%'
+                    hourlyData.append([time, temp, feelsLike, humidity, precip])
+                hourlyFrame = pd.DataFrame(
+                    hourlyData,
+                    columns=['Time','Temp','Feels Like', 'Humidity', 'Precip']
+                    )
+                tableHourly.model = TableModel(hourlyFrame)
+                tableHourly.setModel(tableHourly.model)
+        except:
+            pass
     #Processes and Displays the Daily information. This forecasts 7 days
     def displayDaily(self, json):
         #Display: Date, High, Low, Weather and Precip, Humidity, Wind, (Depending on what fits)
-        daily = json["daily"]
-        tableDaily = self.ui.tableViewDaily
-        dailyData = []
-        for x in daily:
-            date = localizeTime(x["dt"],json["timezone"]).strftime("%b %d, %H:%M")
-            high = f'{x["temp"]["max"]:.0f}\N{DEGREE SIGN}F. Feels like {x["feels_like"]["day"]:.0f}\N{DEGREE SIGN}F'
-            low = f'{x["temp"]["min"]:.0f}\N{DEGREE SIGN}F. Feels like {x["feels_like"]["night"]:.0f}\N{DEGREE SIGN}F'
-            weatherPrecip = f'{x["pop"]:.0%} chance of {x["weather"][0]["description"].capitalize()}'
-            humidity = f'{x["humidity"]:.0f}%'
-            wind = f'{windSpeedDescription(x["wind_speed"])} with wind speeds of {x["wind_speed"]}mph.'
-            dailyData.append([date,high,low,weatherPrecip,humidity,wind])
-        dailyFrame = pd.DataFrame(
-            dailyData,
-            columns=['Date','High','Low','Weather','Humidity','Wind']
-            )
-        tableDaily.model = TableModel(dailyFrame)
-        tableDaily.setModel(tableDaily.model)
+        try:
+            if not isinstance(json, str):
+                daily = json["daily"]
+                tableDaily = self.ui.tableViewDaily
+                dailyData = []
+                for x in daily:
+                    date = localizeTime(x["dt"],json["timezone"]).strftime("%b %d, %H:%M")
+                    high = f'{x["temp"]["max"]:.0f}\N{DEGREE SIGN}F. Feels like {x["feels_like"]["day"]:.0f}\N{DEGREE SIGN}F'
+                    low = f'{x["temp"]["min"]:.0f}\N{DEGREE SIGN}F. Feels like {x["feels_like"]["night"]:.0f}\N{DEGREE SIGN}F'
+                    weatherPrecip = f'{x["pop"]:.0%} chance of {x["weather"][0]["description"].capitalize()}'
+                    humidity = f'{x["humidity"]:.0f}%'
+                    wind = f'{windSpeedDescription(x["wind_speed"])} with wind speeds of {x["wind_speed"]}mph.'
+                    dailyData.append([date,high,low,weatherPrecip,humidity,wind])
+                dailyFrame = pd.DataFrame(
+                    dailyData,
+                    columns=['Date','High','Low','Weather','Humidity','Wind']
+                    )
+                tableDaily.model = TableModel(dailyFrame)
+                tableDaily.setModel(tableDaily.model)
+        except:
+            pass
 
     #Processes and Displays the Weather Alert information. This will display any current weather alerts that are affecting the area. 
     def displayWeatherAlert(self, json):
-        #Display Sender, Event, Start, End, Description from weather alerts. This SHOULD work, but it's hard to test the API against weather alerts as even historical data doesn't contain this field.
+        #Display Sender, Event, Start, End, Description from weather alerts. This SHOULD work, 
+        #but it's hard to test the API against weather alerts as even historical data doesn't contain this field.
         alertsData = []
         tableAlerts = self.ui.tableWeatherAlerts
         try:
